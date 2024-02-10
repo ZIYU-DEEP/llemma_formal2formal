@@ -5,7 +5,12 @@ import heapq
 import concurrent
 import transformers
 import os
+import vllm
+import json
+import time
+from datetime import datetime
 import logging
+
 from transformers import (
     Trainer,
     AutoModelForCausalLM,
@@ -18,6 +23,12 @@ from transformers import (
 from tqdm import tqdm
 from concurrent.futures import ThreadPoolExecutor
 from typing import List, Tuple
+from lean_dojo import *
+import heapq
+import subprocess
+
+from tqdm import tqdm, trange
+from pprint import pprint
 
 
 # -----------------------------------------------
@@ -221,6 +232,30 @@ def generate_vllm(prompt, model, tokenizer, temperatures, num_samples, stop, max
 
 
 ## For HF
+def trim_output(output_text, stop_div='----', trim_at_last=False):
+    """
+    Trims the generated output text to remove the stop sequence and everything after it. Can trim at the first
+    or last occurrence of the stop sequence based on the trim_at_last flag.
+
+    Parameters:
+    - output_text (str): The generated text.
+    - stop_div (str): The sequence after which the text should be trimmed.
+    - trim_at_last (bool): Flag to trim at the last occurrence of stop_div. Default is False.
+
+    Returns:
+    - str: The trimmed text.
+    """
+    if trim_at_last:
+        stop_index = output_text.rfind(stop_div)  # Finds the last occurrence
+    else:
+        stop_index = output_text.find(stop_div)  # Finds the first occurrence
+
+    if stop_index != -1:
+        return output_text[:stop_index]
+    else:
+        return output_text
+
+
 def sequence_scores(out, prompt_length, model, tokenizer, stop_div='----'):
     """
     Returns each output sequence's log probability normalized by the number of tokens.
@@ -233,12 +268,12 @@ def sequence_scores(out, prompt_length, model, tokenizer, stop_div='----'):
 
     # Trim the text
     # Unlike VLLM, the stop words will be retained, so we have to manually remove
+    # This part may still need some improvement
     for i, text_i in enumerate(text):
-        if f'\n{stop_div}</s>' in text_i:
-            text[i] = text_i.replace(f'\n{stop_div}</s>', '</s>')
-
-        if f'\n{stop_div[:-1]}</s>' in text_i:
-            text[i] = text_i.replace(f'\n{stop_div[:-1]}</s>', '</s>')
+        text[i] = trim_output(text_i,
+                              stop_div='----',
+                              trim_at_last=True).strip()
+        text[i] += '</s>'
 
     input_ids = tokenizer(
         text, return_tensors="pt", padding='longest', truncation=True
@@ -275,26 +310,6 @@ class StoppingCriteriaSub(StoppingCriteria):
             if tokenizer.decode(stop) == tokenizer.decode(last_token):
                 return True
         return False
-
-
-def trim_output(output_text, stop_div='---'):
-    """
-    Trims the generated output text to remove the stop sequence and everything after it.
-
-    Parameters:
-    - output_text (str): The generated text.
-    - stop_sequence (str): The sequence after which the text should be trimmed.
-
-    Returns:
-    - str: The trimmed text.
-    """
-    stop_index = output_text.find(stop_div)
-    if stop_index != -1:
-        # Trim the output to just before the stop sequence
-        return output_text[:stop_index]
-    else:
-        # If the stop sequence is not found, return the original text
-        return output_text
 
 
 def generate_hf(prompt, model, tokenizer, temperatures, num_samples, stopping_criteria):
@@ -334,13 +349,14 @@ def generate_hf(prompt, model, tokenizer, temperatures, num_samples, stopping_cr
                 skip_special_tokens=True
             )
 
-            # Remove that '---'
+            # Remove that '----'
             decoded_seqs = [trim_output(text,
-                                 stop_div='---').strip()
+                                 stop_div='----').strip()
                             for text in decoded_seqs]
 
             # Extend to the texts
             texts.extend(decoded_seqs)
+            pprint(texts)
 
             # Get the scores
             scores_ = sequence_scores(
@@ -369,7 +385,8 @@ def best_first_search(
         timeout=600,
         early_stop=False,
         max_tokens=256,
-        stopping_criteria,
+        stopping_criteria=None,
+        gen_method='vllm',
 ) -> dict:
     """
     Best first search.
@@ -400,13 +417,13 @@ def best_first_search(
                 # Get the information from the heapq
                 total_score, steps, state, trace = heapq.heappop(queue)
                 ts = _tactic_state(state)
-                logger.info(f'\nCurrent State:\n{ts}\n')
+                logger.info(f'\nCurrent State:\n{state}\n')
                 visited.add(ts)
 
                 # ---------------------------------------------
                 # Generate results
-                assert args.gen_method in ['vllm', 'hf']
-                if args.gen_method == 'vllm':
+                assert gen_method in ['vllm', 'hf']
+                if gen_method == 'vllm':
                     step_cands, step_scores = generate_vllm(
                         prompt_fn(ts),
                         model,
@@ -417,13 +434,13 @@ def best_first_search(
                         max_tokens=max_tokens
                     )
 
-                elif args.gen_method == 'hf':
+                elif gen_method == 'hf':
                     step_cands, step_scores = generate_hf(
                         prompt=prompt_fn(ts),
                         model=model,
                         tokenizer=tokenizer,
-                        temperatures=[0.0],
-                        num_samples=args.num_samples,
+                        temperatures=temperatures,
+                        num_samples=num_samples,
                         stopping_criteria=stopping_criteria)
 
                 step_cands = [s.strip() for s in step_cands]
@@ -437,6 +454,7 @@ def best_first_search(
                         'tactic': step,
                         'state_before': _tactic_state(state)
                     }
+                    # logger.info(step)
 
                     # When the proof is finished
                     if isinstance(result, ProofFinished):
@@ -454,7 +472,11 @@ def best_first_search(
                         if early_stop:
                             return attempt_results
                         proof_finished = True
-                        logger.info('Proof is finished for this theorem.')
+
+                        logger.info(f'\nstep: {step}; score: {round(score, 3)}')
+                        logger.info('Congrats. Proof is finished for this theorem.')
+                        logger.info(attempt_results[-1]['proof'])
+
                         break
 
                     # When there is still unsolved goals
